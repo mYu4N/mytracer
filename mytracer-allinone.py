@@ -158,7 +158,9 @@ struct event_t {
     u8 flags;
 
     // route info
+    char comm[IFNAMSIZ];
     char ifname[IFNAMSIZ];
+
     u32  netns;
 
     // pkt info
@@ -408,6 +410,7 @@ do_trace_skb(struct event_t *event, void *ctx, struct sk_buff *skb, void *netdev
         event->l4_proto  = iphdr.protocol;
         event->saddr[0] = iphdr.saddr;
         event->daddr[0] = iphdr.daddr;
+        bpf_get_current_comm(event->comm, sizeof(event->comm));
 
 	if (event->l4_proto == IPPROTO_ICMP) {
        	    proto_icmp_echo_request = ICMP_ECHO;
@@ -857,7 +860,7 @@ class TestEvt(ct.Structure):
     _fields_ = [
         ("func_name",   ct.c_char * FUNCNAME_MAX_LEN),
         ("flags",       ct.c_ubyte),
-
+        ("comm",        ct.c_char * IFNAMSIZ),
         ("ifname",      ct.c_char * IFNAMSIZ),
         ("netns",       ct.c_uint),
 
@@ -978,7 +981,7 @@ def event_printer(cpu, data, size):
 
     # Print event
     # print("[%-8s] [%-10s] %-12s %-12s %-40s %s" % (time_str(event), event.netns, event.ifname, mac_info, pkt_info, trace_info)) 
-    print("[%-8s] [%-10s] %-12s %-12s %-40s %s" % (time_str(event), event.netns, trans_bytes_to_string(event.ifname), mac_info, pkt_info, trace_info))
+    print("[%-8s] [%-10s]  %-10s %-12s %-12s %-40s %s" % (time_str(event), event.netns, trans_bytes_to_string(event.comm), trans_bytes_to_string(event.ifname), mac_info, pkt_info, trace_info))
 
     print_stack(event)
     args.catch_count = args.catch_count - 1
@@ -988,7 +991,7 @@ def event_printer(cpu, data, size):
 if __name__ == "__main__":
     b = BPF(text=bpf_text)
     b["route_event"].open_perf_buffer(event_printer)
-    print("%-10s %-12s %-12s %-12s %-40s %s" % ('Time', 'NETWORK_NS', 'INTERFACE', 'DEST_MAC', 'PKT_INFO', 'TRACE_INFO'))
+    print("%-29s %-12s  %-10s %-12s %-12s %-40s %s" % ('Time', 'NETWORK_NS', 'COMMAND', 'INTERFACE', 'DEST_MAC', 'PKT_INFO', 'TRACE_INFO'))
 
     try:
         while True:
