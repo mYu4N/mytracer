@@ -15,9 +15,9 @@ import datetime
 
 examples = """examples:
       mytracer.py                                      # trace all packets
-      mytracer.py --proto=icmp -H 140.205.60.46 --icmpid 22  # trace icmp packet with addr=140.205.60.46 and icmpid=22
-      mytracer.py --proto=tcp  -H 140.205.60.46 -P 22        # trace tcp  packet with addr=140.205.60.46:22
-      mytracer.py --proto=udp  -H 140.205.60.46 -P 22        # trace udp  packet wich addr=140.205.60.46:22
+      mytracer.py --proto=icmp -H 1.2.3.4 --icmpid 22  # trace icmp packet with addr=1.2.3.4 and icmpid=22
+      mytracer.py --proto=tcp  -H 1.2.3.4 -P 22        # trace tcp  packet with addr=1.2.3.4:22
+      mytracer.py --proto=udp  -H 1.2.3.4 -P 22        # trace udp  packet wich addr=1.2.3.4:22
       mytracer.py -T -p 1 --debug -P 80 -H 127.0.0.1 --proto=tcp --callstack --icmpid=100 -N 10000
 """
 
@@ -117,6 +117,9 @@ bpf_text= """
 #include <uapi/linux/icmpv6.h>
 #include <net/inet_sock.h>
 #include <linux/netfilter/x_tables.h>
+#include <uapi/linux/ptrace.h>
+#include <net/sock.h>
+#include <net/tcp.h>
 
 #define ROUTE_EVENT_IF 		0x0001
 #define ROUTE_EVENT_IPTABLE	0x0002
@@ -176,6 +179,8 @@ struct event_t {
     u16 sport;
     u16 dport;
     u16 tcpflags;
+    u32 seq;
+    u32 ack_seq;
 
     // ipt info
     u32 hook;
@@ -452,6 +457,8 @@ do_trace_skb(struct event_t *event, void *ctx, struct sk_buff *skb, void *netdev
         init_tcpflags_bits(event->tcpflags, tcp_flag_word(&tcphdr));
         event->sport = be16_to_cpu(tcphdr.hdr.source);
         event->dport = be16_to_cpu(tcphdr.hdr.dest);
+        event->seq = be32_to_cpu(tcphdr.hdr.seq);      
+        event->ack_seq = be32_to_cpu(tcphdr.hdr.ack_seq);     
         break;
     case IPPROTO_UDP:
         bpf_probe_read(&udphdr, sizeof(udphdr), l4_header_address);
@@ -876,6 +883,8 @@ class TestEvt(ct.Structure):
         ("sport",       ct.c_ushort),
         ("dport",       ct.c_ushort),
         ("tcpflags",    ct.c_ushort),
+        ("seq",         ct.c_uint),
+        ("ack_seq",         ct.c_uint),
 
         ("hook",        ct.c_uint),
         ("pf",          ct.c_ubyte),
@@ -981,7 +990,7 @@ def event_printer(cpu, data, size):
 
     # Print event
     # print("[%-8s] [%-10s] %-12s %-12s %-40s %s" % (time_str(event), event.netns, event.ifname, mac_info, pkt_info, trace_info)) 
-    print("[%-8s] [%-10s]  %-10s %-12s %-12s %-40s %s" % (time_str(event), event.netns, trans_bytes_to_string(event.comm), trans_bytes_to_string(event.ifname), mac_info, pkt_info, trace_info))
+    print("[%-8s] [%-10s]  %-10s %-12s %-12s %-12s %-12s %-40s %s" % (time_str(event), event.netns, trans_bytes_to_string(event.comm), trans_bytes_to_string(event.ifname), mac_info, event.seq, event.ack_seq, pkt_info, trace_info))
 
     print_stack(event)
     args.catch_count = args.catch_count - 1
@@ -991,7 +1000,7 @@ def event_printer(cpu, data, size):
 if __name__ == "__main__":
     b = BPF(text=bpf_text)
     b["route_event"].open_perf_buffer(event_printer)
-    print("%-29s %-12s  %-10s %-12s %-12s %-40s %s" % ('Time', 'NETWORK_NS', 'COMMAND', 'INTERFACE', 'DEST_MAC', 'PKT_INFO', 'TRACE_INFO'))
+    print("%-29s %-12s  %-10s %-12s %-12s %-12s %-12s %-40s %s" % ('Time', 'NETWORK_NS', 'COMMAND', 'INTERFACE', 'DEST_MAC', 'Seq', 'Ack', 'PKT_INFO', 'TRACE_INFO'))
 
     try:
         while True:
