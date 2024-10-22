@@ -15,9 +15,9 @@ import datetime
 
 examples = """examples:
       mytracer.py                                      # trace all packets
-      mytracer.py --proto=icmp -H 1.2.3.4 --icmpid 22  # trace icmp packet with addr=1.2.3.4 and icmpid=22
-      mytracer.py --proto=tcp  -H 1.2.3.4 -P 22        # trace tcp  packet with addr=1.2.3.4:22
-      mytracer.py --proto=udp  -H 1.2.3.4 -P 22        # trace udp  packet wich addr=1.2.3.4:22
+      mytracer.py --proto=icmp -H 140.205.60.46 --icmpid 22  # trace icmp packet with addr=140.205.60.46 and icmpid=22
+      mytracer.py --proto=tcp  -H 140.205.60.46 -P 22        # trace tcp  packet with addr=140.205.60.46:22
+      mytracer.py --proto=udp  -H 140.205.60.46 -P 22        # trace udp  packet wich addr=140.205.60.46:22
       mytracer.py -T -p 1 --debug -P 80 -H 127.0.0.1 --proto=tcp --callstack --icmpid=100 -N 10000
 """
 
@@ -181,6 +181,7 @@ struct event_t {
     u16 tcpflags;
     u32 seq;
     u32 ack_seq;
+ //   u32 tcp_len;
 
     // ipt info
     u32 hook;
@@ -458,7 +459,8 @@ do_trace_skb(struct event_t *event, void *ctx, struct sk_buff *skb, void *netdev
         event->sport = be16_to_cpu(tcphdr.hdr.source);
         event->dport = be16_to_cpu(tcphdr.hdr.dest);
         event->seq = be32_to_cpu(tcphdr.hdr.seq);      
-        event->ack_seq = be32_to_cpu(tcphdr.hdr.ack_seq);     
+        event->ack_seq = be32_to_cpu(tcphdr.hdr.ack_seq);
+        // event->tcp_len = tcphdr.hdr.doff * 4;
         break;
     case IPPROTO_UDP:
         bpf_probe_read(&udphdr, sizeof(udphdr), l4_header_address);
@@ -574,6 +576,28 @@ int kprobe__packet_rcv(struct pt_regs *ctx, struct sk_buff *skb, struct net_devi
 }
 
 int kprobe__napi_gro_receive(struct pt_regs *ctx, struct napi_struct *napi, struct sk_buff *skb)
+{
+    return do_trace(ctx, skb, __func__+8, NULL);
+}
+
+
+/*
+ * tcp recv hook:
+ * 1) int __tcp_v4_rcv(struct sk_buff *skb, struct net_device *sb_dev)
+ * 2) ...
+ */
+
+int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
+{
+    return do_trace(ctx, skb, __func__+8, NULL);
+}
+
+/*
+ * skb copy hook:
+ * 1) int skb_copy_datagram_iter(const struct sk_buff *skb, int offset, struct iov_iter *to, int len)
+ * 2) ...
+ */
+int kprobe__skb_copy_datagram_iter(struct pt_regs *ctx, const struct sk_buff *skb, int offset, struct iov_iter *to, int len)
 {
     return do_trace(ctx, skb, __func__+8, NULL);
 }
@@ -936,14 +960,7 @@ def print_stack(event):
         for addr in kernel_tmp:
             kernel_stack.append(addr)
     for addr in kernel_stack:
-        # print("    %s" % b.ksym(addr))
-       # print("    %s" % b.sym(addr, -1, show_offset=True))
         print("    %s" % trans_bytes_to_string(b.sym(addr, -1, show_offset=True)))
-#    elif args.time:
-#        return "%-7s " % time.strftime("%H:%M:%S")
-#        return "%-7s " % datetime.datetime.now()
-#    else:
-#        return "%-7.6f " % ((event.start_ns - earliest_ts) / 1000000000.0)
 
 def time_str(event):
     if args.time:
