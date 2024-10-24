@@ -188,7 +188,6 @@ struct event_t {
     u8 pf;
     u32 verdict;
     char tablename[XT_TABLE_MAXNAMELEN];
-    u64 ipt_delay;
 
     void *skb;
     // skb info
@@ -199,7 +198,6 @@ struct event_t {
     u64 kernel_ip;
 
     //time
-    u64 start_ns;
     u64 test;
 };
 BPF_PERF_OUTPUT(route_event);
@@ -209,7 +207,6 @@ struct ipt_do_table_args
     struct sk_buff *skb;
     const struct nf_hook_state *state;
     struct xt_table *table;
-    u64 start_ns;
 };
 BPF_HASH(cur_ipt_do_table_args, u32, struct ipt_do_table_args);
 
@@ -537,8 +534,6 @@ do_trace(void *ctx, struct sk_buff *skb, const char *func_name, void *netdev)
     event.skb=skb;
     bpf_probe_read(&type.value, 1, ((char*)skb) + offsetof(typeof(*skb), __pkt_type_offset));
     event.pkt_type = type.pkt_type;
-
-    event.start_ns = bpf_ktime_get_ns();
     bpf_strncpy(event.func_name, func_name, FUNCNAME_MAX_LEN);
     CALL_STACK(ctx, &event);
     route_event.perf_submit(ctx, &event, sizeof(event));
@@ -673,13 +668,13 @@ int kprobe____br_forward(struct pt_regs *ctx, const void *to, struct sk_buff *sk
 /*
 if the kernel version is  5.10.x kernel(alinux3)，we need disable this probe(kprobe__deliver_clone). 
 If the kernel version below 4.19(alinux2), this probe you can enable 
-
+if you use flannel network ,please open this probe
 
 int kprobe__deliver_clone(struct pt_regs *ctx, const void *prev, struct sk_buff *skb, bool local_orig)
 {
    return do_trace(ctx, skb, __func__+8, NULL);
 }
-*/
+
 
 int kprobe__br_forward_finish(struct pt_regs *ctx, struct net *net, struct sock *sk, struct sk_buff *skb)
 {
@@ -705,7 +700,7 @@ int kprobe__br_nf_dev_queue_xmit(struct pt_regs *ctx, struct net *net, struct so
 {
    return do_trace(ctx, skb, __func__+8, NULL);
 }
-
+*/
 
 /*
  * ip layer:
@@ -751,7 +746,6 @@ __ipt_do_table_in(struct pt_regs *ctx, struct sk_buff *skb,
         .state = state,
         .table = table,
     };
-    args.start_ns = bpf_ktime_get_ns();
     cur_ipt_do_table_args.update(&pid, &args);
 
     return 0;
@@ -775,7 +769,6 @@ __ipt_do_table_out(struct pt_regs * ctx, struct sk_buff *skb)
         return 0;
 
     event.flags |= ROUTE_EVENT_IPTABLE;
-    event.ipt_delay = bpf_ktime_get_ns() - args->start_ns;
     member_read(&event.hook, args->state, hook);
     member_read(&event.pf, args->state, pf);
     member_read(&event.tablename, args->table, name);
@@ -783,8 +776,6 @@ __ipt_do_table_out(struct pt_regs * ctx, struct sk_buff *skb)
     event.skb=args->skb;
     bpf_probe_read(&type.value, 1, ((char*)args->skb) + offsetof(typeof(*args->skb), __pkt_type_offset));
     event.pkt_type = type.pkt_type;
-
-    event.start_ns = bpf_ktime_get_ns();
     CALL_STACK(ctx, &event);
     route_event.perf_submit(ctx, &event, sizeof(event));
 
@@ -816,7 +807,6 @@ int kprobe____kfree_skb(struct pt_regs *ctx, struct sk_buff *skb)
         return 0;
 
     event.flags |= ROUTE_EVENT_DROP;
-    event.start_ns = bpf_ktime_get_ns();
     bpf_strncpy(event.func_name, __func__+8, FUNCNAME_MAX_LEN);
     get_stack(ctx, &event);
     route_event.perf_submit(ctx, &event, sizeof(event));
@@ -914,7 +904,6 @@ class TestEvt(ct.Structure):
         ("pf",          ct.c_ubyte),
         ("verdict",     ct.c_uint),
         ("tablename",   ct.c_char * XT_TABLE_MAXNAMELEN),
-        ("ipt_delay",   ct.c_ulonglong),
 
         ("skb",         ct.c_ulonglong),
         ("pkt_type",    ct.c_ubyte),
@@ -922,7 +911,6 @@ class TestEvt(ct.Structure):
 	("kernel_stack_id", ct.c_int),
 	("kernel_ip",   ct.c_ulonglong),
 
-	("start_ns",    ct.c_ulonglong),
 	("test",        ct.c_ulonglong)
     ]
 
