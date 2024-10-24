@@ -15,7 +15,7 @@ Linux内核数据包收发链路路径图如下：
 [https://github.com/mYu4N/mytracer](https://github.com/mYu4N/mytracer)
 ## 安装部署：
 
-1. 需要使用alinux2及以上的系统版本（4.19+），alinux3当时有兼容性问题，正在修复中，修复版本请单独联系我获取
+1. 需要使用内核版本（4.19+及以上）如Alinux 2 / Alinux3
 2. 依赖ebpf相关组件，可安装bcctools工具合集
 ```json
 yum install kernel-devel-`uname -r` bcc-tools
