@@ -1,3 +1,6 @@
+2024-10-22
+增加tcp_v4_rcv,skb_copy_datagram_iter函数监控
+--------------------
 # Mytracer介绍：
 Mytracer是一款用于分析Linux内核数据包收发链路的工具，可以快速的打印数据包经过的内核函数以及iptables的表链转发路径，可用于网络延迟、偶发丢包等内核网络异常场景的排查，也可方便内核网络爱好者进行学习与研究。
 
@@ -18,7 +21,7 @@ Linux内核数据包收发链路路径图如下：
 yum install kernel-devel-`uname -r` bcc-tools
 ```
 
-3. 下载文件mytracer.py 及mytracer.c，置于同目录下，运行 python mytracer.py -h 即可查看详细使用方法。
+3. 下载文件mytracer.py ，置于同目录下，运行 python mytracer.py -h 即可查看详细使用方法。
 4. 查看内核函数对应的源码需要安装kernel-debuginfo，建议系统内常备kernel-debuginfo及kernel-devel，然后使用faddr2line工具查找该函数地址对应的代码行号。
 ```json
 yum install kernel-debuginfo-`uname -r`
