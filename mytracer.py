@@ -243,14 +243,14 @@ union ___skb_pkt_type {
   } while(0)
 
 enum {
-__TCP_FLAG_CWR,
-__TCP_FLAG_ECE,
-__TCP_FLAG_URG,
-__TCP_FLAG_ACK,
-__TCP_FLAG_PSH,
-__TCP_FLAG_RST,
-__TCP_FLAG_SYN,
-__TCP_FLAG_FIN
+    __TCP_FLAG_FIN,  // 0
+    __TCP_FLAG_SYN,  // 1
+    __TCP_FLAG_RST,  // 2
+    __TCP_FLAG_PSH,  // 3
+    __TCP_FLAG_ACK,  // 4
+    __TCP_FLAG_URG,  // 5
+    __TCP_FLAG_ECE,  // 6
+    __TCP_FLAG_CWR   // 7
 };
 
 static void bpf_strncpy(char *dst, const char *src, int n)
@@ -276,18 +276,20 @@ static void bpf_strncpy(char *dst, const char *src, int n)
             new_flags |= (1U<<__##flag); \
         } \
     } while (0)
+
 #define init_tcpflags_bits(new_flags, orig_flags) \
     ({ \
         new_flags = 0; \
-        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_CWR); \
-        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_ECE); \
-        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_URG); \
-        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_ACK); \
-        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_PSH); \
-        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_RST); \
-        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_SYN); \
         TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_FIN); \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_SYN); \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_RST); \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_PSH); \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_ACK); \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_URG); \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_ECE); \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_CWR); \
     })
+
 
 static void get_stack(struct pt_regs *ctx, struct event_t *event)
 {
@@ -861,14 +863,14 @@ HOOKNAMES = [
 ]
 
 TCPFLAGS = [
-    "CWR",
-    "ECE",
-    "URG",
-    "ACK",
-    "PSH",
-    "RST",
-    "SYN",
     "FIN",
+    "SYN",
+    "RST",
+    "PSH",
+    "ACK",
+    "URG",
+    "ECE",
+    "CWR",
 ]
 
 ROUTE_EVENT_IF = 0x0001
@@ -922,6 +924,7 @@ def _get(l, index, default):
     if index < len(l):
         return l[index]
     return default
+
 def _get_tcpflags(tcpflags):
     flag=""
     start=1
@@ -969,7 +972,8 @@ def event_printer(cpu, data, size):
     else:
         return
 
-    mac_info = ''.join('%02x' % b for b in event.dest_mac)
+
+    mac_info = ':'.join(f'{b:02x}' for b in event.dest_mac)
 
     if event.l4_proto == socket.IPPROTO_TCP:
         pkt_info = "T_%s:%s:%u->%s:%u" % (_get_tcpflags(event.tcpflags), saddr, event.sport, daddr, event.dport)
@@ -994,7 +998,6 @@ def event_printer(cpu, data, size):
     trace_info = "%x.%u:%s%s" % (event.skb, event.pkt_type, iptables, trans_bytes_to_string(event.func_name))
 
     # Print event
-    # print("[%-8s] [%-10s] %-12s %-12s %-40s %s" % (time_str(event), event.netns, event.ifname, mac_info, pkt_info, trace_info)) 
     print("[%-8s] [%-10s]  %-10s %-12s %-12s %-12s %-12s %-40s %s" % (time_str(event), event.netns, trans_bytes_to_string(event.comm), trans_bytes_to_string(event.ifname), mac_info, event.seq, event.ack_seq, pkt_info, trace_info))
 
     print_stack(event)
