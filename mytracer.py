@@ -15,10 +15,9 @@ import datetime
 
 examples = """examples:
       mytracer.py                                      # trace all packets
-      mytracer.py --proto=icmp -H 140.205.60.46 --icmpid 22  # trace icmp packet with addr=140.205.60.46 and icmpid=22
-      mytracer.py --proto=tcp  -H 140.205.60.46 -P 22        # trace tcp  packet with addr=140.205.60.46:22
-      mytracer.py --proto=udp  -H 140.205.60.46 -P 22        # trace udp  packet wich addr=140.205.60.46:22
-      mytracer.py -T -p 1 --debug -P 80 -H 127.0.0.1 --proto=tcp --callstack --icmpid=100 -N 10000
+      mytracer.py --proto=tcp -H 1.2.3.4   # trace tcp packet with addr=1.2.3.4 
+      mytracer.py --proto=tcp  -H 1.2.3.4 --dropstack      # trace drop packet with addr=1.2.3.4 
+      mytracer.py --proto=udp  -H 1.2.3.4 -P 53  --callstack      # trace udp kernel stack  wich addr=1.2.3.4 and port=22
 """
 
 parser = argparse.ArgumentParser(
@@ -590,8 +589,7 @@ int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
     return do_trace(ctx, skb, __func__+8, NULL);
 }
 
-
-/* if dropstack cannot caputre error packet,please open this probe
+/* if dropstack cannot caputre error packet,please open this probe，use callstack args
 int kprobe__tcp_validate_incoming(struct pt_regs *ctx, struct sock *sk, struct sk_buff *skb, const struct tcphdr *th, int syn_inerr)
 {
     return do_trace(ctx, skb, __func__+8, NULL);
@@ -745,7 +743,7 @@ int kretprobe__ipt_do_table(struct pt_regs *ctx)
 
 
 #if __BCC_dropstack
-int kprobe__kfree_skb(struct pt_regs *ctx, struct sk_buff *skb)
+int kprobe____kfree_skb(struct pt_regs *ctx, struct sk_buff *skb)
 {
     struct event_t event = {};
 
