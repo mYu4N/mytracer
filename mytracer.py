@@ -915,7 +915,7 @@ def event_printer(cpu, data, size):
         return
 
 
-    mac_info = ':'.join(f'{b:02x}' for b in event.dest_mac)
+    mac_info = ''.join('%02x' % b for b in event.dest_mac)
 
     if event.l4_proto == socket.IPPROTO_TCP:
         pkt_info = "T_%s:%s:%u->%s:%u" % (_get_tcpflags(event.tcpflags), saddr, event.sport, daddr, event.dport)
