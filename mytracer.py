@@ -104,7 +104,6 @@ bpf_args+="#define __BCC_iptable (%d)\n" % (args.iptable)
 bpf_args+="#define __BCC_route (%d)\n" % (args.route)
 bpf_args+="#define __BCC_keep (%d)\n" % (args.keep)
 
-
 # bpf_text=open(r"mytracer.c", "r").read()
 bpf_text= """
 #include <bcc/proto.h>
@@ -676,6 +675,11 @@ int kprobe__ip_finish_output(struct pt_regs *ctx, struct net *net, struct sock *
    return do_trace(ctx, skb, __func__+8, NULL);
 }
 
+int kprobe____ip_local_out(struct pt_regs *ctx, struct net *net, struct sock *sk, struct sk_buff *skb)
+{
+   return do_trace(ctx, skb, __func__+8, NULL);
+}
+
 #endif
 
 #if __BCC_iptable
@@ -915,7 +919,7 @@ def event_printer(cpu, data, size):
         return
 
 
-    mac_info = ''.join('%02x' % b for b in event.dest_mac)
+    mac_info = ':'.join(f'{b:02x}' for b in event.dest_mac)
 
     if event.l4_proto == socket.IPPROTO_TCP:
         pkt_info = "T_%s:%s:%u->%s:%u" % (_get_tcpflags(event.tcpflags), saddr, event.sport, daddr, event.dport)
