@@ -1,0 +1,572 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+import sys, os, socket, argparse, struct, datetime
+import ctypes as ct
+from socket import inet_ntop, AF_INET, AF_INET6
+from struct import pack
+from bcc import BPF
+
+examples = """examples:
+  # 仅抓 TCP 路径点
+  mytracer6.py --proto=tcp -H 1.2.3.4
+
+  # 仅抓 UDP 路径点 + 端口过滤
+  mytracer6.py --proto=udp -H 1.2.3.4 -P 53
+
+  # 抓 TCP 路径点 + 栈
+  mytracer6.py --proto=tcp -H 1.2.3.4 --callstack
+
+  # 仅抓 drop 点（不需要 --proto）
+  mytracer6.py --dropstack -H 1.2.3.4
+"""
+
+parser = argparse.ArgumentParser(
+    description="Multi-function packet tracer (selective attach) - no nft",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+
+parser.add_argument("-H", "--ipaddr", type=str, help="ip address")
+parser.add_argument("--proto", type=str, help="tcp|udp|icmp")
+parser.add_argument("--icmpid", type=int, default=0, help="trace icmp id (for icmp)")
+parser.add_argument("-P", "--port", type=int, default=0, help="udp/tcp port")
+parser.add_argument("-p", "--pid", type=int, default=0, help="trace this PID only")
+parser.add_argument("-N", "--netns", type=int, default=0, help="trace this Network Namespace only")
+parser.add_argument("-c", "--catch-count", type=int, default=1000000, help="catch and print count")
+
+parser.add_argument("--dropstack", action="store_true", help="trace kfree_skb and print stack")
+parser.add_argument("--callstack", action="store_true", help="print kernel stack for every event")
+parser.add_argument("--skbcopy", action="store_true", help="trace skb_copy_datagram_iter (only when tracing tcp/udp)")
+
+# kept for compatibility, but time is always printed
+parser.add_argument("-T", "--time", action="store_true", help=argparse.SUPPRESS)
+parser.add_argument("--ebpf", action="store_true", help=argparse.SUPPRESS)
+
+args = parser.parse_args()
+
+# ---- Decide what to trace (default: trace nothing) ----
+trace_netpath = args.proto in ("tcp", "udp")   # only when tcp/udp
+trace_icmp    = args.proto == "icmp"           # icmp filter/parse
+trace_drop    = args.dropstack
+
+if not (trace_netpath or trace_icmp or trace_drop):
+    print("No tracing enabled. Use --proto=tcp/udp/icmp or --dropstack.\n")
+    parser.print_help()
+    sys.exit(1)
+
+ipproto = {"tcp": 6, "udp": 17, "icmp": 1}
+proto = 0 if args.proto is None else ipproto.get(args.proto, 0)
+
+ipaddr = (struct.unpack("I", socket.inet_aton("0" if args.ipaddr is None else args.ipaddr))[0])
+port = args.port
+icmpid = socket.htons(args.icmpid)
+
+bpf_def = "#define __BCC_ARGS__\n"
+bpf_args = ""
+bpf_args += f"#define __BCC_pid ({args.pid})\n"
+bpf_args += f"#define __BCC_ipaddr (0x{ipaddr:x})\n"
+bpf_args += f"#define __BCC_port ({port})\n"
+bpf_args += f"#define __BCC_netns ({args.netns})\n"
+bpf_args += f"#define __BCC_proto ({proto})\n"
+bpf_args += f"#define __BCC_icmpid ({icmpid})\n"
+bpf_args += f"#define __BCC_dropstack ({1 if args.dropstack else 0})\n"
+bpf_args += f"#define __BCC_callstack ({1 if args.callstack else 0})\n"
+# icmp uses the same path probes, but filtered in parsing logic
+bpf_args += f"#define __BCC_trace_netpath ({1 if (trace_netpath or trace_icmp) else 0})\n"
+bpf_args += f"#define __BCC_trace_drop ({1 if trace_drop else 0})\n"
+bpf_args += f"#define __BCC_my_pid ({os.getpid()})\n"
+bpf_args += f"#define __BCC_skbcopy ({1 if (args.skbcopy and trace_netpath) else 0})\n"
+
+bpf_text = r"""
+#include <bcc/proto.h>
+#include <uapi/linux/ptrace.h>
+
+#include <uapi/linux/ip.h>
+#include <uapi/linux/ipv6.h>
+#include <uapi/linux/icmp.h>
+#include <uapi/linux/tcp.h>
+#include <uapi/linux/udp.h>
+#include <uapi/linux/icmpv6.h>
+
+#include <net/tcp.h>
+
+#define ROUTE_EVENT_IF          0x0001
+#define ROUTE_EVENT_DROP        0x0004
+
+#ifdef __BCC_ARGS__
+__BCC_ARGS_DEFINE__
+#else
+#define __BCC_pid        0
+#define __BCC_ipaddr     0
+#define __BCC_port       0
+#define __BCC_icmpid     0
+#define __BCC_callstack  0
+#define __BCC_proto      0
+#define __BCC_netns      0
+#define __BCC_my_pid     0
+#define __BCC_skbcopy    0
+#define __BCC_trace_netpath 0
+#define __BCC_trace_drop 0
+#endif
+
+BPF_STACK_TRACE(stacks, 2048);
+
+#define FUNCNAME_MAX_LEN 64
+
+struct __attribute__((packed)) event_t {
+    char func_name[FUNCNAME_MAX_LEN];
+    u8 flags;
+
+    char comm[IFNAMSIZ];
+    char ifname[IFNAMSIZ];
+    u32 netns;
+
+    u8 dest_mac[6];
+    u32 len;
+    u8 ip_version;
+    u8 l4_proto;
+    u64 saddr[2];
+    u64 daddr[2];
+    u8 icmptype;
+    u16 icmpid;
+    u16 icmpseq;
+    u16 sport;
+    u16 dport;
+    u16 tcpflags;
+    u32 seq;
+    u32 ack_seq;
+
+    u64 skb;
+    u8 pkt_type;
+
+    int kernel_stack_id;
+    u64 kernel_ip;
+};
+
+BPF_PERF_OUTPUT(route_event);
+BPF_PERCPU_ARRAY(tmp_event, struct event_t, 1);
+
+static __always_inline struct event_t *get_event(void)
+{
+    u32 k = 0;
+    struct event_t *e = tmp_event.lookup(&k);
+    if (!e) return NULL;
+    __builtin_memset(e, 0, sizeof(*e));
+    return e;
+}
+
+union ___skb_pkt_type {
+    __u8 value;
+    struct {
+        __u8 __pkt_type_offset[0];
+        __u8 pkt_type:3;
+        __u8 pfmemalloc:1;
+        __u8 ignore_df:1;
+        __u8 nf_trace:1;
+        __u8 ip_summed:2;
+    };
+};
+
+#define MAC_HEADER_SIZE 14;
+#define member_address(source_struct, source_member) \
+    ({ void* __ret; __ret = (void*)(((char*)source_struct) + offsetof(typeof(*source_struct), source_member)); __ret; })
+#define member_read(destination, source_struct, source_member) \
+  do { bpf_probe_read(destination, sizeof(source_struct->source_member), member_address(source_struct, source_member)); } while (0)
+
+enum { __TCP_FLAG_FIN, __TCP_FLAG_SYN, __TCP_FLAG_RST, __TCP_FLAG_PSH, __TCP_FLAG_ACK, __TCP_FLAG_URG, __TCP_FLAG_ECE, __TCP_FLAG_CWR };
+
+static void bpf_strncpy(char *dst, const char *src, int n)
+{
+    int i = 0, j;
+#define CPY(n) do { for (; i < n; i++) { if (src[i] == 0) return; dst[i] = src[i]; } } while(0)
+    for (j = 10; j < 64; j += 10) CPY(j);
+    CPY(64);
+#undef CPY
+}
+
+#define TCP_FLAGS_INIT(new_flags, orig_flags, flag) \
+    do { if (orig_flags & flag) { new_flags |= (1U<<__##flag); } } while (0)
+#define init_tcpflags_bits(new_flags, orig_flags) \
+    ({ \
+        new_flags = 0; \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_FIN); \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_SYN); \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_RST); \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_PSH); \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_ACK); \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_URG); \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_ECE); \
+        TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_CWR); \
+    })
+
+static void get_stack(struct pt_regs *ctx, struct event_t *event)
+{
+    event->kernel_stack_id = stacks.get_stackid(ctx, 0);
+    if (event->kernel_stack_id >= 0) {
+        u64 ip = PT_REGS_IP(ctx);
+        u64 page_offset;
+#if defined(CONFIG_X86_64) && defined(__PAGE_OFFSET_BASE)
+        page_offset = __PAGE_OFFSET_BASE;
+#elif defined(CONFIG_X86_64) && defined(__PAGE_OFFSET_BASE_L4)
+#if defined(CONFIG_DYNAMIC_MEMORY_LAYOUT) && defined(CONFIG_X86_5LEVEL)
+        page_offset = __PAGE_OFFSET_BASE_L5;
+#else
+        page_offset = __PAGE_OFFSET_BASE_L4;
+#endif
+#else
+        page_offset = PAGE_OFFSET;
+#endif
+        if (ip > page_offset)
+            event->kernel_ip = ip;
+    }
+}
+#define CALL_STACK(ctx, event) do { if (__BCC_callstack) get_stack(ctx, event); } while (0)
+
+static int do_trace_skb(struct event_t *event, void *ctx, struct sk_buff *skb, void *netdev)
+{
+    struct net_device *dev;
+
+    char *head;
+    u16 mac_header;
+    u16 network_header;
+    char *l2_header_address;
+    char *l3_header_address;
+    char *l4_header_address;
+
+    u8 proto_icmp_echo_request = 0;
+    u8 proto_icmp_echo_reply = 0;
+    u8 l4_offset_from_ip_header = 0;
+
+    struct icmphdr icmphdr;
+    union tcp_word_hdr tcphdr;
+    struct udphdr udphdr;
+
+    event->ifname[0] = 0;
+    if (netdev) dev = netdev;
+    else member_read(&dev, skb, dev);
+
+    if (dev)
+        bpf_probe_read(&event->ifname, IFNAMSIZ, dev->name);
+    if (event->ifname[0] == 0 || dev == NULL)
+        bpf_strncpy(event->ifname, "nil", IFNAMSIZ);
+
+    event->flags |= ROUTE_EVENT_IF;
+
+#ifdef CONFIG_NET_NS
+    struct net* net;
+    possible_net_t *skc_net = &dev->nd_net;
+    member_read(&net, skc_net, net);
+    struct ns_common *ns = member_address(net, ns);
+    member_read(&event->netns, ns, inum);
+#endif
+
+    member_read(&event->len, skb, len);
+    member_read(&head, skb, head);
+    member_read(&mac_header, skb, mac_header);
+    member_read(&network_header, skb, network_header);
+    if (network_header == 0)
+        network_header = mac_header + MAC_HEADER_SIZE;
+
+    l2_header_address = mac_header + head;
+    bpf_probe_read(&event->dest_mac, 6, l2_header_address);
+
+    l3_header_address = head + network_header;
+    bpf_probe_read(&event->ip_version, sizeof(u8), l3_header_address);
+    event->ip_version = (event->ip_version >> 4) & 0xf;
+
+    if (event->ip_version == 4) {
+        struct iphdr iphdr;
+        bpf_probe_read(&iphdr, sizeof(iphdr), l3_header_address);
+
+        l4_offset_from_ip_header = iphdr.ihl * 4;
+        event->l4_proto = iphdr.protocol;
+        event->saddr[0] = iphdr.saddr;
+        event->daddr[0] = iphdr.daddr;
+        bpf_get_current_comm(event->comm, sizeof(event->comm));
+
+        if (event->l4_proto == IPPROTO_ICMP) {
+            proto_icmp_echo_request = ICMP_ECHO;
+            proto_icmp_echo_reply   = ICMP_ECHOREPLY;
+        }
+    } else if (event->ip_version == 6) {
+        struct ipv6hdr* ipv6hdr = (struct ipv6hdr*)l3_header_address;
+        l4_offset_from_ip_header = sizeof(*ipv6hdr);
+
+        bpf_probe_read(&event->l4_proto, sizeof(ipv6hdr->nexthdr),
+                       (char*)ipv6hdr + offsetof(struct ipv6hdr, nexthdr));
+        bpf_probe_read(event->saddr, sizeof(ipv6hdr->saddr),
+                       (char*)ipv6hdr + offsetof(struct ipv6hdr, saddr));
+        bpf_probe_read(event->daddr, sizeof(ipv6hdr->daddr),
+                       (char*)ipv6hdr + offsetof(struct ipv6hdr, daddr));
+
+        if (event->l4_proto == IPPROTO_ICMPV6) {
+            proto_icmp_echo_request = ICMPV6_ECHO_REQUEST;
+            proto_icmp_echo_reply   = ICMPV6_ECHO_REPLY;
+        }
+    } else {
+        return -1;
+    }
+
+    l4_header_address = l3_header_address + l4_offset_from_ip_header;
+    switch (event->l4_proto) {
+    case IPPROTO_ICMPV6:
+    case IPPROTO_ICMP:
+        bpf_probe_read(&icmphdr, sizeof(icmphdr), l4_header_address);
+        if (icmphdr.type != proto_icmp_echo_request && icmphdr.type != proto_icmp_echo_reply)
+            return -1;
+        event->icmptype = icmphdr.type;
+        event->icmpid   = be16_to_cpu(icmphdr.un.echo.id);
+        event->icmpseq  = be16_to_cpu(icmphdr.un.echo.sequence);
+        break;
+    case IPPROTO_TCP:
+        bpf_probe_read(&tcphdr, sizeof(tcphdr), l4_header_address);
+        init_tcpflags_bits(event->tcpflags, tcp_flag_word(&tcphdr));
+        event->sport = be16_to_cpu(tcphdr.hdr.source);
+        event->dport = be16_to_cpu(tcphdr.hdr.dest);
+        event->seq = be32_to_cpu(tcphdr.hdr.seq);
+        event->ack_seq = be32_to_cpu(tcphdr.hdr.ack_seq);
+        break;
+    case IPPROTO_UDP:
+        bpf_probe_read(&udphdr, sizeof(udphdr), l4_header_address);
+        event->sport = be16_to_cpu(udphdr.source);
+        event->dport = be16_to_cpu(udphdr.dest);
+        break;
+    default:
+        return -1;
+    }
+
+    // filters
+    if (__BCC_netns != 0 && event->netns != 0 && event->netns != __BCC_netns)
+        return -1;
+
+#if __BCC_pid
+    u64 tgid = bpf_get_current_pid_tgid() >> 32;
+    if (tgid != __BCC_pid)
+        return -1;
+#endif
+
+#if __BCC_ipaddr
+    if (event->ip_version == 4) {
+        if (__BCC_ipaddr != event->saddr[0] && __BCC_ipaddr != event->daddr[0])
+            return -1;
+    } else {
+        return -1;
+    }
+#endif
+
+#if __BCC_proto
+    if (__BCC_proto != event->l4_proto)
+        return -1;
+#endif
+
+#if __BCC_port
+    if ((event->l4_proto == IPPROTO_UDP || event->l4_proto == IPPROTO_TCP) &&
+        (__BCC_port != event->sport && __BCC_port != event->dport))
+        return -1;
+#endif
+
+    return 0;
+}
+
+static int submit_evt(void *ctx, struct event_t *e)
+{
+    route_event.perf_submit((struct pt_regs *)ctx, e, sizeof(*e));
+    return 0;
+}
+
+static int do_trace(void *ctx, struct sk_buff *skb, const char *func_name, void *netdev)
+{
+    u64 current_pid_tgid = bpf_get_current_pid_tgid();
+    u32 current_tgid = current_pid_tgid >> 32;
+    if (current_tgid == __BCC_my_pid)
+        return 0;
+
+    struct event_t *event = get_event();
+    if (!event)
+        return 0;
+
+    union ___skb_pkt_type type = {};
+
+    if (do_trace_skb(event, ctx, skb, netdev) < 0)
+        return 0;
+
+    event->skb = (u64)skb;
+    bpf_probe_read(&type.value, 1, ((char*)skb) + offsetof(typeof(*skb), __pkt_type_offset));
+    event->pkt_type = type.pkt_type;
+
+    bpf_strncpy(event->func_name, func_name, FUNCNAME_MAX_LEN);
+    CALL_STACK((struct pt_regs *)ctx, event);
+    return submit_evt(ctx, event);
+}
+
+// -------- net path probes (only compiled when __BCC_trace_netpath==1) ----------
+#if __BCC_trace_netpath
+int kprobe__netif_rx(struct pt_regs *ctx, struct sk_buff *skb) { return do_trace(ctx, skb, __func__+8, NULL); }
+int kprobe____netif_receive_skb(struct pt_regs *ctx, struct sk_buff *skb) { return do_trace(ctx, skb, __func__+8, NULL); }
+int kprobe__napi_gro_receive(struct pt_regs *ctx, struct napi_struct *napi, struct sk_buff *skb) { return do_trace(ctx, skb, __func__+8, NULL); }
+int kprobe____dev_queue_xmit(struct pt_regs *ctx, struct sk_buff *skb, struct net_device *sb_dev) { return do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe__ip_rcv(struct pt_regs *ctx, struct sk_buff *skb, struct net_device *dev, struct packet_type *pt, struct net_device *orig_dev)
+{ return do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe__ip_rcv_finish(struct pt_regs *ctx, struct net *net, struct sock *sk, struct sk_buff *skb)
+{ return do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe____ip_local_out(struct pt_regs *ctx, struct net *net, struct sock *sk, struct sk_buff *skb)
+{ return do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe__ip_output(struct pt_regs *ctx, struct net *net, struct sock *sk, struct sk_buff *skb)
+{ return do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe__ip_finish_output(struct pt_regs *ctx, struct net *net, struct sock *sk, struct sk_buff *skb)
+{ return do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
+{ return do_trace(ctx, skb, __func__+8, NULL); }
+
+#if __BCC_skbcopy
+int kprobe__skb_copy_datagram_iter(struct pt_regs *ctx, const struct sk_buff *skb, int offset, struct iov_iter *to, int len)
+{ return do_trace(ctx, (struct sk_buff *)skb, __func__+8, NULL); }
+#endif
+#endif // __BCC_trace_netpath
+
+// -------- drop probe (only compiled when __BCC_trace_drop==1) ----------
+#if __BCC_trace_drop
+int kprobe____kfree_skb(struct pt_regs *ctx, struct sk_buff *skb)
+{
+    struct event_t *event = get_event();
+    if (!event) return 0;
+    if (do_trace_skb(event, ctx, skb, NULL) < 0) return 0;
+
+    event->flags |= ROUTE_EVENT_DROP;
+    bpf_strncpy(event->func_name, __func__+8, FUNCNAME_MAX_LEN);
+    get_stack(ctx, event);
+    return submit_evt(ctx, event);
+}
+#endif
+"""
+
+bpf_text = bpf_def + bpf_text
+bpf_text = bpf_text.replace("__BCC_ARGS_DEFINE__", bpf_args)
+
+if args.ebpf:
+    print(bpf_text)
+    sys.exit(0)
+
+# ctypes / constants (must match C)
+IFNAMSIZ = 16
+FUNCNAME_MAX_LEN = 64
+TCPFLAGS = ["FIN", "SYN", "RST", "PSH", "ACK", "URG", "ECE", "CWR"]
+
+class TestEvt(ct.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("func_name",   ct.c_char * FUNCNAME_MAX_LEN),
+        ("flags",       ct.c_ubyte),
+
+        ("comm",        ct.c_char * IFNAMSIZ),
+        ("ifname",      ct.c_char * IFNAMSIZ),
+        ("netns",       ct.c_uint),
+
+        ("dest_mac",    ct.c_ubyte * 6),
+        ("len",         ct.c_uint),
+        ("ip_version",  ct.c_ubyte),
+        ("l4_proto",    ct.c_ubyte),
+        ("saddr",       ct.c_ulonglong * 2),
+        ("daddr",       ct.c_ulonglong * 2),
+        ("icmptype",    ct.c_ubyte),
+        ("icmpid",      ct.c_ushort),
+        ("icmpseq",     ct.c_ushort),
+        ("sport",       ct.c_ushort),
+        ("dport",       ct.c_ushort),
+        ("tcpflags",    ct.c_ushort),
+        ("seq",         ct.c_uint),
+        ("ack_seq",     ct.c_uint),
+
+        ("skb",         ct.c_ulonglong),
+        ("pkt_type",    ct.c_ubyte),
+
+        ("kernel_stack_id", ct.c_int),
+        ("kernel_ip",   ct.c_ulonglong),
+    ]
+
+EXPECTED_SIZE = ct.sizeof(TestEvt)
+
+def _get_tcpflags(tcpflags):
+    return ",".join([TCPFLAGS[i] for i in range(len(TCPFLAGS)) if tcpflags & (1 << i)])
+
+def trans_bytes_to_string(bbytes):
+    return bbytes.decode(errors="replace") if isinstance(bbytes, (bytes, bytearray)) else bbytes
+
+def time_str():
+    # Always print full timestamp (match reference style)
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f ")
+
+def print_stack(event):
+    stack_traces = b.get_table("stacks")
+    if event.kernel_stack_id > 0:
+        for addr in stack_traces.walk(event.kernel_stack_id):
+            print("    %s" % trans_bytes_to_string(b.sym(addr, -1, show_offset=True)))
+
+def event_printer(cpu, data, size):
+    # hard gate by size to avoid any mismatch crash
+    if size < EXPECTED_SIZE:
+        return
+
+    raw = ct.string_at(data, EXPECTED_SIZE)
+    event = TestEvt.from_buffer_copy(raw)
+
+    if event.ip_version == 4:
+        saddr = inet_ntop(AF_INET, pack("=I", event.saddr[0]))
+        daddr = inet_ntop(AF_INET, pack("=I", event.daddr[0]))
+    elif event.ip_version == 6:
+        saddr = inet_ntop(AF_INET6, bytes(event.saddr))
+        daddr = inet_ntop(AF_INET6, bytes(event.daddr))
+    else:
+        return
+
+    mac_info = ':'.join(f'{b:02x}' for b in event.dest_mac)
+
+    if event.l4_proto == socket.IPPROTO_TCP:
+        pkt_info = "T_%s:%s:%u->%s:%u" % (_get_tcpflags(event.tcpflags), saddr, event.sport, daddr, event.dport)
+    elif event.l4_proto == socket.IPPROTO_UDP:
+        pkt_info = "U:%s:%u->%s:%u" % (saddr, event.sport, daddr, event.dport)
+    elif event.l4_proto == socket.IPPROTO_ICMP:
+        pkt_info = "I:%s->%s" % (saddr, daddr)
+    else:
+        pkt_info = "%u:%s->%s" % (event.l4_proto, saddr, daddr)
+
+    trace_info = "%x.%u:%s" % (
+        event.skb, event.pkt_type,
+        trans_bytes_to_string(event.func_name).rstrip("\x00")
+    )
+
+    print("[%-27s] [%-10u]  %-10s %-12s %-17s %-12u %-12u %-40s %s" % (
+        time_str(),
+        event.netns,
+        trans_bytes_to_string(event.comm).rstrip("\x00"),
+        trans_bytes_to_string(event.ifname).rstrip("\x00"),
+        mac_info,
+        event.seq,
+        event.ack_seq,
+        pkt_info,
+        trace_info
+    ))
+
+    if args.dropstack or args.callstack:
+        print_stack(event)
+
+    args.catch_count -= 1
+    if args.catch_count <= 0:
+        sys.exit(0)
+
+if __name__ == "__main__":
+    b = BPF(text=bpf_text, cflags=["-I/usr/local/include"])
+    b["route_event"].open_perf_buffer(event_printer)
+
+    print("Time                          NETWORK_NS    COMMAND    INTERFACE    DEST_MAC           Seq          Ack          PKT_INFO                                 TRACE_INFO")
+    try:
+        while True:
+            b.kprobe_poll(10)
+    except KeyboardInterrupt:
+        sys.exit(0)
