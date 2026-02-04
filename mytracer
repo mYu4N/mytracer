@@ -1,0 +1,874 @@
+#!/usr/bin/env python3
+# coding: utf-8
+#
+# mytracer + nftables + tcp_cleanup_rbuf + udp_send_rcv - 改进
+# 修复：nft table/chain 名称乱码问题 ，按 offsetof 偏移读取
+# 修复：icmp输出request reply
+# 增强：tcp_cleanup_rbuf 跟踪
+# 增强：udp 跟踪
+# 依赖：bcc-tools kernel-devel kernel-headers kernel-debuginfo
+#
+
+import sys, os, socket, argparse, struct, datetime, platform, re
+import ctypes as ct
+from socket import inet_ntop, AF_INET, AF_INET6
+from struct import pack
+from bcc import BPF
+
+examples = """examples:
+  mytracer --proto=tcp -H 1.2.3.4 --nft
+  mytracer --nft -H 1.2.3.4
+  mytracer --proto=udp -P 8080 -p 1234
+  mytracer --proto=icmp --icmpid 100
+  mytracer --dropstack --callstack
+  mytracer --nft --nft-chain-table-off 64 --nft-chain-name-off 88 --nft-table-name-off 280
+"""
+
+def validate_args(args):
+    """验证命令行参数"""
+    if args.ipaddr:
+        try:
+            socket.inet_aton(args.ipaddr)
+        except socket.error:
+            raise ValueError(f"Invalid IP address: {args.ipaddr}")
+    
+    if args.port and (args.port < 1 or args.port > 65535):
+        raise ValueError(f"Port must be between 1 and 65535, got: {args.port}")
+    
+    if args.proto and args.proto not in ['tcp', 'udp', 'icmp']:
+        raise ValueError(f"Protocol must be tcp, udp, or icmp, got: {args.proto}")
+    
+    if args.icmpid and args.icmpid < 0:
+        raise ValueError(f"ICMP ID must be non-negative, got: {args.icmpid}")
+    
+    if args.pid and args.pid < 0:
+        raise ValueError(f"PID must be non-negative, got: {args.pid}")
+    
+    if args.netns and args.netns < 0:
+        raise ValueError(f"NetNS must be non-negative, got: {args.netns}")
+
+parser = argparse.ArgumentParser(
+    description="Multi-function packet tracer + nftables + tcp_cleanup_rbuf tracking",
+    formatter_class=argparse.RawDescriptionHelpFormatter,
+    epilog=examples)
+
+parser.add_argument("-H", "--ipaddr", type=str, help="ip address")
+parser.add_argument("--proto", type=str, help="tcp|udp|icmp")
+parser.add_argument("--icmpid", type=int, default=0, help="trace icmp id (for icmp)")
+parser.add_argument("-P", "--port", type=int, default=0, help="udp/tcp port")
+parser.add_argument("-p", "--pid", type=int, default=0, help="trace this PID only")
+parser.add_argument("-N", "--netns", type=int, default=0, help="trace this Network Namespace only")
+parser.add_argument("-c", "--catch-count", type=int, default=1000000, help="catch and print count")
+
+parser.add_argument("--dropstack", action="store_true", help="trace kfree_skb and print stack")
+parser.add_argument("--callstack", action="store_true", help="print kernel stack for every event")
+parser.add_argument("--skbcopy", action="store_true", help="trace skb_copy_datagram_iter (only when tracing tcp/udp)")
+parser.add_argument("--nft", action="store_true", help="trace nftables: nft_do_chain* and print table/chain")
+
+# nft offsetof overrides
+parser.add_argument("--nft-pktinfo-skb-off", type=int, default=-1, help="offsetof(struct nft_pktinfo, skb)")
+parser.add_argument("--nft-chain-table-off", type=int, default=-1, help="offsetof(struct nft_chain, table)")
+parser.add_argument("--nft-chain-name-off", type=int, default=-1, help="offsetof(struct nft_chain, name)")
+parser.add_argument("--nft-table-name-off", type=int, default=-1, help="offsetof(struct nft_table, name)")
+
+args = parser.parse_args()
+
+try:
+    validate_args(args)
+except ValueError as e:
+    print(f"Argument validation error: {e}", file=sys.stderr)
+    sys.exit(1)
+
+trace_netpath = args.proto in ("tcp", "udp")
+trace_icmp    = args.proto == "icmp"
+trace_drop    = args.dropstack
+trace_nft     = args.nft
+trace_skbcopy = args.skbcopy and trace_netpath
+
+if not (trace_netpath or trace_icmp or trace_drop or trace_nft or trace_skbcopy):
+    print("No tracing enabled. Use --proto=tcp/udp/icmp or --dropstack or --nft or --skbcopy.\n", file=sys.stderr)
+    parser.print_help()
+    sys.exit(1)
+
+ipproto = {"tcp": 6, "udp": 17, "icmp": 1}
+proto = 0 if args.proto is None else ipproto.get(args.proto, 0)
+
+ipaddr = (struct.unpack("I", socket.inet_aton("0" if args.ipaddr is None else args.ipaddr))[0])
+port = args.port
+icmpid = socket.htons(args.icmpid)
+
+def guess_nft_offsets():
+    """
+    Use your measured stable offsets for chain fields:
+      pktinfo->skb: 0
+      chain->table: 64
+      chain->name: 88
+    For table->name: differs across 5.10/6.6 in your env (272 vs 280).
+    We'll guess by kernel major.minor.
+    """
+    rel = platform.release()
+    m = re.match(r"^(\d+)\.(\d+)\.", rel)
+    maj, minor = (0, 0)
+    if m:
+        maj, minor = int(m.group(1)), int(m.group(2))
+
+    nft_pktinfo_skb_off = 0
+    nft_chain_table_off = 64
+    nft_chain_name_off = 88
+
+    # default guess:
+    nft_table_name_off = 280
+    if maj == 5 and minor == 10:
+        nft_table_name_off = 272
+    elif maj >= 6:
+        nft_table_name_off = 280
+
+    return nft_pktinfo_skb_off, nft_chain_table_off, nft_chain_name_off, nft_table_name_off
+
+g_pkt_skb, g_chain_tbl, g_chain_name, g_tbl_name = guess_nft_offsets()
+
+NFT_PKTINFO_SKB_OFF = g_pkt_skb if args.nft_pktinfo_skb_off < 0 else args.nft_pktinfo_skb_off
+NFT_CHAIN_TABLE_OFF = g_chain_tbl if args.nft_chain_table_off < 0 else args.nft_chain_table_off
+NFT_CHAIN_NAME_OFF  = g_chain_name if args.nft_chain_name_off < 0 else args.nft_chain_name_off
+NFT_TABLE_NAME_OFF  = g_tbl_name if args.nft_table_name_off < 0 else args.nft_table_name_off
+
+# ---- BPF compile-time args with 'my' prefix ----
+bpf_def = "#define __BCC_ARGS__\n"
+bpf_args = ""
+bpf_args += f"#define my__BCC_pid ({args.pid})\n"
+bpf_args += f"#define my__BCC_ipaddr (0x{ipaddr:x})\n"
+bpf_args += f"#define my__BCC_port ({port})\n"
+bpf_args += f"#define my__BCC_netns ({args.netns})\n"
+bpf_args += f"#define my__BCC_proto ({proto})\n"
+bpf_args += f"#define my__BCC_icmpid ({icmpid})\n"
+bpf_args += f"#define my__BCC_dropstack ({1 if args.dropstack else 0})\n"
+bpf_args += f"#define my__BCC_callstack ({1 if args.callstack else 0})\n"
+bpf_args += f"#define my__BCC_trace_netpath ({1 if (trace_netpath or trace_icmp) else 0})\n"
+bpf_args += f"#define my__BCC_trace_drop ({1 if trace_drop else 0})\n"
+bpf_args += f"#define my__BCC_trace_nft ({1 if trace_nft else 0})\n"
+bpf_args += f"#define my__BCC_my_pid ({os.getpid()})\n"
+bpf_args += f"#define my__BCC_skbcopy ({1 if trace_skbcopy else 0})\n"
+
+# inject offsets
+bpf_args += f"#define my__NFT_PKTINFO_SKB_OFF ({NFT_PKTINFO_SKB_OFF})\n"
+bpf_args += f"#define my__NFT_CHAIN_TABLE_OFF ({NFT_CHAIN_TABLE_OFF})\n"
+bpf_args += f"#define my__NFT_CHAIN_NAME_OFF ({NFT_CHAIN_NAME_OFF})\n"
+bpf_args += f"#define my__NFT_TABLE_NAME_OFF ({NFT_TABLE_NAME_OFF})\n"
+
+bpf_text = r"""
+#include <bcc/proto.h>
+#include <uapi/linux/ptrace.h>
+#include <uapi/linux/ip.h>
+#include <uapi/linux/ipv6.h>
+#include <uapi/linux/icmp.h>
+#include <uapi/linux/tcp.h>
+#include <uapi/linux/udp.h>
+#include <uapi/linux/icmpv6.h>
+#include <net/flow.h>
+#include <linux/skbuff.h>
+#include <net/tcp.h>
+#include <net/sock.h>
+#include <linux/in.h>
+#include <linux/in6.h>
+
+#define my_ROUTE_EVENT_IF          0x0001
+#define my_ROUTE_EVENT_DROP        0x0004
+#define my_ROUTE_EVENT_NFT         0x0008
+#define my_ROUTE_EVENT_SKBCOPY     0x0010
+#define my_ROUTE_EVENT_TCP_CLEANUP 0x0020
+
+#ifdef __BCC_ARGS__
+__BCC_ARGS_DEFINE__
+#else
+#define my__BCC_pid        0
+#define my__BCC_ipaddr     0
+#define my__BCC_port       0
+#define my__BCC_icmpid     0
+#define my__BCC_callstack  0
+#define my__BCC_proto      0
+#define my__BCC_netns      0
+#define my__BCC_my_pid     0
+#define my__BCC_skbcopy    0
+#define my__BCC_trace_netpath 0
+#define my__BCC_trace_drop 0
+#define my__BCC_trace_nft  0
+
+#define my__NFT_PKTINFO_SKB_OFF 0
+#define my__NFT_CHAIN_TABLE_OFF 64
+#define my__NFT_CHAIN_NAME_OFF 88
+#define my__NFT_TABLE_NAME_OFF 280
+#endif
+
+BPF_STACK_TRACE(my_stacks, 2048);
+
+#define my_FUNCNAME_MAX_LEN 64
+#define my_NFT_NAME_MAX_LEN 32
+
+struct __attribute__((packed)) my_event_t {
+    char func_name[my_FUNCNAME_MAX_LEN];
+    u8 flags;
+
+    char comm[IFNAMSIZ];
+    char ifname[IFNAMSIZ];
+    u32 netns;
+
+    u8 dest_mac[6];
+    u32 len;
+    u8 ip_version;
+    u8 l4_proto;
+    u64 saddr[2];
+    u64 daddr[2];
+    u8 icmptype;
+    u16 icmpid;
+    u16 icmpseq;
+    u16 sport;
+    u16 dport;
+    u16 tcpflags;
+    u32 seq;
+    u32 ack_seq;
+
+    u64 skb;
+    u8 pkt_type;
+
+    int kernel_stack_id;
+    u64 kernel_ip;
+
+    char nft_table[my_NFT_NAME_MAX_LEN];
+    char nft_chain[my_NFT_NAME_MAX_LEN];
+};
+
+BPF_PERF_OUTPUT(my_route_event);
+BPF_PERCPU_ARRAY(my_tmp_event, struct my_event_t, 1);
+
+static __always_inline struct my_event_t *my_get_event(void)
+{
+    u32 k = 0;
+    struct my_event_t *e = my_tmp_event.lookup(&k);
+    if (!e) return NULL;
+    __builtin_memset(e, 0, sizeof(*e));
+    return e;
+}
+
+union my___skb_pkt_type {
+    __u8 value;
+    struct {
+        __u8 __pkt_type_offset[0];
+        __u8 pkt_type:3;
+        __u8 pfmemalloc:1;
+        __u8 ignore_df:1;
+        __u8 nf_trace:1;
+        __u8 ip_summed:2;
+    };
+};
+
+#define my_MAC_HEADER_SIZE 14;
+#define my_member_address(source_struct, source_member) \
+    ({ void* __ret; __ret = (void*)(((char*)source_struct) + offsetof(typeof(*source_struct), source_member)); __ret; })
+#define my_member_read(destination, source_struct, source_member) \
+  do { bpf_probe_read(destination, sizeof(source_struct->source_member), my_member_address(source_struct, source_member)); } while (0)
+
+enum { my__TCP_FLAG_FIN, my__TCP_FLAG_SYN, my__TCP_FLAG_RST, my__TCP_FLAG_PSH, my__TCP_FLAG_ACK, my__TCP_FLAG_URG, my__TCP_FLAG_ECE, my__TCP_FLAG_CWR };
+
+static void my_bpf_strncpy(char *dst, const char *src, int n)
+{
+    int i = 0, j;
+#define my_CPY(n) do { for (; i < n; i++) { if (src[i] == 0) return; dst[i] = src[i]; } } while(0)
+    for (j = 10; j < 64; j += 10) my_CPY(j);
+    my_CPY(64);
+#undef my_CPY
+}
+
+#define my_TCP_FLAGS_INIT(new_flags, orig_flags, flag) \
+    do { if (orig_flags & flag) { new_flags |= (1U<<my__##flag); } } while (0)
+#define my_init_tcpflags_bits(new_flags, orig_flags) \
+    ({ \
+        new_flags = 0; \
+        my_TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_FIN); \
+        my_TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_SYN); \
+        my_TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_RST); \
+        my_TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_PSH); \
+        my_TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_ACK); \
+        my_TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_URG); \
+        my_TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_ECE); \
+        my_TCP_FLAGS_INIT(new_flags, orig_flags, TCP_FLAG_CWR); \
+    })
+
+static void my_get_stack(struct pt_regs *ctx, struct my_event_t *event)
+{
+    event->kernel_stack_id = my_stacks.get_stackid(ctx, 0);
+    if (event->kernel_stack_id >= 0) {
+        u64 ip = PT_REGS_IP(ctx);
+        u64 page_offset;
+#if defined(CONFIG_X86_64) && defined(__PAGE_OFFSET_BASE)
+        page_offset = __PAGE_OFFSET_BASE;
+#elif defined(CONFIG_X86_64) && defined(__PAGE_OFFSET_BASE_L4)
+#if defined(CONFIG_DYNAMIC_MEMORY_LAYOUT) && defined(CONFIG_X86_5LEVEL)
+        page_offset = __PAGE_OFFSET_BASE_L5;
+#else
+        page_offset = __PAGE_OFFSET_BASE_L4;
+#endif
+#else
+        page_offset = PAGE_OFFSET;
+#endif
+        if (ip > page_offset)
+            event->kernel_ip = ip;
+    }
+}
+#define my_CALL_STACK(ctx, event) do { if (my__BCC_callstack) my_get_stack(ctx, event); } while (0)
+
+static int my_do_trace_skb(struct my_event_t *event, void *ctx, struct sk_buff *skb, void *netdev)
+{
+    struct net_device *dev;
+
+    char *head;
+    u16 mac_header;
+    u16 network_header;
+    char *l2_header_address;
+    char *l3_header_address;
+    char *l4_header_address;
+
+    u8 proto_icmp_echo_request = 0;
+    u8 proto_icmp_echo_reply = 0;
+    u8 l4_offset_from_ip_header = 0;
+
+    struct icmphdr icmphdr;
+    union tcp_word_hdr tcphdr;
+    struct udphdr udphdr;
+
+    event->ifname[0] = 0;
+    if (netdev) dev = netdev;
+    else my_member_read(&dev, skb, dev);
+
+    if (dev)
+        bpf_probe_read(&event->ifname, IFNAMSIZ, dev->name);
+    if (event->ifname[0] == 0 || dev == NULL)
+        my_bpf_strncpy(event->ifname, "nil", IFNAMSIZ);
+
+    event->flags |= my_ROUTE_EVENT_IF;
+
+#ifdef CONFIG_NET_NS
+    struct net* net;
+    possible_net_t *skc_net = &dev->nd_net;
+    my_member_read(&net, skc_net, net);
+    struct ns_common *ns = my_member_address(net, ns);
+    my_member_read(&event->netns, ns, inum);
+#endif
+
+    my_member_read(&event->len, skb, len);
+    my_member_read(&head, skb, head);
+    my_member_read(&mac_header, skb, mac_header);
+    my_member_read(&network_header, skb, network_header);
+    if (network_header == 0)
+        network_header = mac_header + my_MAC_HEADER_SIZE;
+
+    l2_header_address = mac_header + head;
+    bpf_probe_read(&event->dest_mac, 6, l2_header_address);
+
+    l3_header_address = head + network_header;
+    bpf_probe_read(&event->ip_version, sizeof(u8), l3_header_address);
+    event->ip_version = (event->ip_version >> 4) & 0xf;
+
+    if (event->ip_version == 4) {
+        struct iphdr iphdr;
+        bpf_probe_read(&iphdr, sizeof(iphdr), l3_header_address);
+
+        l4_offset_from_ip_header = iphdr.ihl * 4;
+        event->l4_proto = iphdr.protocol;
+        event->saddr[0] = iphdr.saddr;
+        event->daddr[0] = iphdr.daddr;
+        bpf_get_current_comm(event->comm, sizeof(event->comm));
+
+        if (event->l4_proto == IPPROTO_ICMP) {
+            proto_icmp_echo_request = ICMP_ECHO;
+            proto_icmp_echo_reply   = ICMP_ECHOREPLY;
+        }
+    } else if (event->ip_version == 6) {
+        struct ipv6hdr* ipv6hdr = (struct ipv6hdr*)l3_header_address;
+        l4_offset_from_ip_header = sizeof(*ipv6hdr);
+
+        bpf_probe_read(&event->l4_proto, sizeof(ipv6hdr->nexthdr),
+                       (char*)ipv6hdr + offsetof(struct ipv6hdr, nexthdr));
+        bpf_probe_read(event->saddr, sizeof(ipv6hdr->saddr),
+                       (char*)ipv6hdr + offsetof(struct ipv6hdr, saddr));
+        bpf_probe_read(event->daddr, sizeof(ipv6hdr->daddr),
+                       (char*)ipv6hdr + offsetof(struct ipv6hdr, daddr));
+
+        if (event->l4_proto == IPPROTO_ICMPV6) {
+            proto_icmp_echo_request = ICMPV6_ECHO_REQUEST;
+            proto_icmp_echo_reply   = ICMPV6_ECHO_REPLY;
+        }
+    } else {
+        return -1;
+    }
+
+    l4_header_address = l3_header_address + l4_offset_from_ip_header;
+    switch (event->l4_proto) {
+    case IPPROTO_ICMPV6:
+    case IPPROTO_ICMP:
+        bpf_probe_read(&icmphdr, sizeof(icmphdr), l4_header_address);
+        if (icmphdr.type != proto_icmp_echo_request && icmphdr.type != proto_icmp_echo_reply)
+            return -1;
+        event->icmptype = icmphdr.type;
+        event->icmpid   = be16_to_cpu(icmphdr.un.echo.id);
+        event->icmpseq  = be16_to_cpu(icmphdr.un.echo.sequence);
+        break;
+    case IPPROTO_TCP:
+        bpf_probe_read(&tcphdr, sizeof(tcphdr), l4_header_address);
+        my_init_tcpflags_bits(event->tcpflags, tcp_flag_word(&tcphdr));
+        event->sport = be16_to_cpu(tcphdr.hdr.source);
+        event->dport = be16_to_cpu(tcphdr.hdr.dest);
+        event->seq = be32_to_cpu(tcphdr.hdr.seq);
+        event->ack_seq = be32_to_cpu(tcphdr.hdr.ack_seq);
+        break;
+    case IPPROTO_UDP:
+        bpf_probe_read(&udphdr, sizeof(udphdr), l4_header_address);
+        event->sport = be16_to_cpu(udphdr.source);
+        event->dport = be16_to_cpu(udphdr.dest);
+        break;
+    default:
+        return -1;
+    }
+
+    if (my__BCC_netns != 0 && event->netns != 0 && event->netns != my__BCC_netns)
+        return -1;
+
+#if my__BCC_pid
+    u64 tgid = bpf_get_current_pid_tgid() >> 32;
+    if (tgid != my__BCC_pid)
+        return -1;
+#endif
+
+#if my__BCC_ipaddr
+    if (event->ip_version == 4) {
+        if (my__BCC_ipaddr != event->saddr[0] && my__BCC_ipaddr != event->daddr[0])
+            return -1;
+    } else {
+        return -1;
+    }
+#endif
+
+#if my__BCC_proto
+    if (my__BCC_proto != event->l4_proto)
+        return -1;
+#endif
+
+#if my__BCC_port
+    if ((event->l4_proto == IPPROTO_UDP || event->l4_proto == IPPROTO_TCP) &&
+        (my__BCC_port != event->sport && my__BCC_port != event->dport))
+        return -1;
+#endif
+
+    return 0;
+}
+
+static __always_inline int my_submit_evt(void *ctx, struct my_event_t *e)
+{
+    my_route_event.perf_submit((struct pt_regs *)ctx, e, sizeof(*e));
+    return 0;
+}
+
+static int my_do_trace(void *ctx, struct sk_buff *skb, const char *func_name, void *netdev)
+{
+    u64 current_pid_tgid = bpf_get_current_pid_tgid();
+    u32 current_tgid = current_pid_tgid >> 32;
+    if (current_tgid == my__BCC_my_pid)
+        return 0;
+
+    struct my_event_t *event = my_get_event();
+    if (!event)
+        return 0;
+
+    union my___skb_pkt_type type = {};
+    if (my_do_trace_skb(event, ctx, skb, netdev) < 0)
+        return 0;
+
+    event->skb = (u64)skb;
+    bpf_probe_read(&type.value, 1, ((char*)skb) + offsetof(typeof(*skb), __pkt_type_offset));
+    event->pkt_type = type.pkt_type;
+
+    my_bpf_strncpy(event->func_name, func_name, my_FUNCNAME_MAX_LEN);
+    my_CALL_STACK((struct pt_regs *)ctx, event);
+    return my_submit_evt(ctx, event);
+}
+
+#if my__BCC_trace_netpath
+
+int kprobe__netif_rx(struct pt_regs *ctx, struct sk_buff *skb)
+{ return my_do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe____netif_receive_skb(struct pt_regs *ctx, struct sk_buff *skb)
+{ return my_do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe__napi_gro_receive(struct pt_regs *ctx, struct napi_struct *napi, struct sk_buff *skb)
+{ return my_do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe____dev_queue_xmit(struct pt_regs *ctx, struct sk_buff *skb, struct net_device *sb_dev)
+{ return my_do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe__ip_rcv(struct pt_regs *ctx, struct sk_buff *skb, struct net_device *dev,
+                   struct packet_type *pt, struct net_device *orig_dev)
+{ return my_do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe__ip_rcv_finish(struct pt_regs *ctx, struct net *net, struct sock *sk, struct sk_buff *skb)
+{ return my_do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe____ip_local_out(struct pt_regs *ctx, struct net *net, struct sock *sk, struct sk_buff *skb)
+{ return my_do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe__ip_output(struct pt_regs *ctx, struct net *net, struct sock *sk, struct sk_buff *skb)
+{ return my_do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe__ip_finish_output(struct pt_regs *ctx, struct net *net, struct sock *sk, struct sk_buff *skb)
+{ return my_do_trace(ctx, skb, __func__+8, NULL); }
+
+
+// my__BCC_proto: tcp=6 udp=17 icmp=1 0=未指定(兼容模式：都挂)
+
+#if my__BCC_proto == 6   // TCP only
+int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
+{ return my_do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe____tcp_transmit_skb(struct pt_regs *ctx, struct sock *sk, struct sk_buff *skb)
+{ return my_do_trace(ctx, skb, __func__+8, NULL); }
+
+#endif
+
+#if my__BCC_proto == 17  // UDP only
+
+int kprobe____udp4_lib_rcv(struct pt_regs *ctx, struct sk_buff *skb, void *udptable, int proto)
+{ return my_do_trace(ctx, skb, "__udp4_lib_rcv", NULL); }
+
+int kprobe____udp_enqueue_schedule_skb(struct pt_regs *ctx, struct sock *sk, struct sk_buff *skb)
+{ return my_do_trace(ctx, skb, "__udp_enqueue_schedule_skb", NULL); }
+
+int kprobe__udp_send_skb(struct pt_regs *ctx, struct sk_buff *skb, void *fl4, void *cork)
+{
+    return my_do_trace(ctx, skb, __func__+8, NULL);
+}
+
+#endif
+
+
+#if my__BCC_proto == 0
+
+int kprobe__tcp_v4_rcv(struct pt_regs *ctx, struct sk_buff *skb)
+{ return my_do_trace(ctx, skb, __func__+8, NULL); }
+
+int kprobe____udp4_lib_rcv(struct pt_regs *ctx, struct sk_buff *skb, void *udptable, int proto)
+{ return my_do_trace(ctx, skb, "__udp4_lib_rcv", NULL); }
+
+int kprobe____udp_enqueue_schedule_skb(struct pt_regs *ctx, struct sock *sk, struct sk_buff *skb)
+{ return my_do_trace(ctx, skb, "__udp_enqueue_schedule_skb", NULL); }
+
+#endif
+
+#endif  // my__BCC_trace_netpath
+
+
+#if my__BCC_trace_drop
+int kprobe____kfree_skb(struct pt_regs *ctx, struct sk_buff *skb)
+{
+    struct my_event_t *event = my_get_event();
+    if (!event) return 0;
+    if (my_do_trace_skb(event, ctx, skb, NULL) < 0) return 0;
+
+    event->flags |= my_ROUTE_EVENT_DROP;
+    my_bpf_strncpy(event->func_name, __func__+8, my_FUNCNAME_MAX_LEN);
+    my_get_stack(ctx, event);
+    return my_submit_evt(ctx, event);
+}
+#endif
+
+#if my__BCC_trace_nft
+static __always_inline int my_do_trace_nft(struct pt_regs *ctx, void *pkt_void, void *chain_void, const char *func_name)
+{
+    if (!pkt_void || !chain_void)
+        return 0;
+
+    struct sk_buff *skb = NULL;
+    bpf_probe_read(&skb, sizeof(skb), (char *)pkt_void + my__NFT_PKTINFO_SKB_OFF);
+    if (!skb)
+        return 0;
+
+    struct my_event_t *event = my_get_event();
+    if (!event)
+        return 0;
+
+    if (my_do_trace_skb(event, ctx, skb, NULL) < 0)
+        return 0;
+
+    event->flags |= my_ROUTE_EVENT_NFT;
+    event->skb = (u64)skb;
+
+    void *table_ptr = NULL;
+    bpf_probe_read(&table_ptr, sizeof(table_ptr), (char *)chain_void + my__NFT_CHAIN_TABLE_OFF);
+
+    /* chain->name is a pointer: read pointer first, then read string */
+    const char *chain_name_ptr = NULL;
+    bpf_probe_read(&chain_name_ptr, sizeof(chain_name_ptr),
+                   (char *)chain_void + my__NFT_CHAIN_NAME_OFF);
+    if (chain_name_ptr) {
+        bpf_probe_read_str(event->nft_chain, sizeof(event->nft_chain), chain_name_ptr);
+    }
+
+    /* table->name is a pointer too */
+    if (table_ptr) {
+        const char *table_name_ptr = NULL;
+        bpf_probe_read(&table_name_ptr, sizeof(table_name_ptr),
+                       (char *)table_ptr + my__NFT_TABLE_NAME_OFF);
+        if (table_name_ptr) {
+            bpf_probe_read_str(event->nft_table, sizeof(event->nft_table), table_name_ptr);
+        }
+    }
+
+    my_bpf_strncpy(event->func_name, func_name, my_FUNCNAME_MAX_LEN);
+    my_CALL_STACK(ctx, event);
+    return my_submit_evt(ctx, event);
+}
+
+int kprobe__nft_do_chain(struct pt_regs *ctx, void *pkt, void *chain)
+{ return my_do_trace_nft(ctx, pkt, chain, __func__+8); }
+
+int kprobe__nft_do_chain_ipv4(struct pt_regs *ctx, void *pkt, void *chain)
+{ return my_do_trace_nft(ctx, pkt, chain, __func__+8); }
+
+int kprobe__nft_do_chain_inet(struct pt_regs *ctx, void *pkt, void *chain)
+{ return my_do_trace_nft(ctx, pkt, chain, __func__+8); }
+
+int kprobe__nft_do_chain_inet_ingress(struct pt_regs *ctx, void *pkt, void *chain)
+{ return my_do_trace_nft(ctx, pkt, chain, __func__+8); }
+
+int kprobe__nft_do_chain_bridge(struct pt_regs *ctx, void *pkt, void *chain)
+{ return my_do_trace_nft(ctx, pkt, chain, __func__+8); }
+
+int kprobe__nft_do_chain_netdev(struct pt_regs *ctx, void *pkt, void *chain)
+{ return my_do_trace_nft(ctx, pkt, chain, __func__+8); }
+
+int kprobe__nft_do_chain_arp(struct pt_regs *ctx, void *pkt, void *chain)
+{ return my_do_trace_nft(ctx, pkt, chain, __func__+8); }
+#endif
+
+#if my__BCC_skbcopy
+// Track when data is copied from kernel to user space
+int kprobe__skb_copy_datagram_iter(struct pt_regs *ctx, const struct sk_buff *skb, int offset, struct iov_iter *to, int len)
+{
+    struct my_event_t *event = my_get_event();
+    if (!event) return 0;
+    
+    // Convert sk_buff to socket for tracking
+    struct sock *sk = NULL;
+    bpf_probe_read(&sk, sizeof(sk), &skb->sk);
+    if (!sk) return 0;
+    
+    if (my_do_trace_skb(event, ctx, (struct sk_buff *)skb, NULL) < 0)
+        return 0;
+
+    event->flags |= my_ROUTE_EVENT_SKBCOPY;
+    event->skb = (u64)skb;
+    
+    // Store timestamp for delay calculation
+
+    my_bpf_strncpy(event->func_name, __func__+8, my_FUNCNAME_MAX_LEN);
+    my_CALL_STACK(ctx, event);
+    return my_submit_evt(ctx, event);
+}
+
+// Track when TCP buffer is cleaned up (application finished reading)
+int kprobe__tcp_cleanup_rbuf(struct pt_regs *ctx, struct sock *sk, int copied)
+{
+    struct my_event_t *event = my_get_event();
+    if (!event) return 0;
+    
+    // Get first skb from receive queue to extract network info
+    struct sk_buff *skb = NULL;
+    bpf_probe_read(&skb, sizeof(skb), &sk->sk_receive_queue.next);
+    if (!skb || (void*)skb == &sk->sk_receive_queue) return 0;
+    
+    if (my_do_trace_skb(event, ctx, skb, NULL) < 0)
+        return 0;
+
+    event->flags |= my_ROUTE_EVENT_TCP_CLEANUP;
+    event->skb = (u64)skb;
+    
+    // Calculate delay from skb_copy to tcp_cleanup
+    my_bpf_strncpy(event->func_name, __func__+8, my_FUNCNAME_MAX_LEN);
+    my_CALL_STACK(ctx, event);
+    return my_submit_evt(ctx, event);
+}
+#endif
+"""
+
+bpf_text = bpf_def + bpf_text
+bpf_text = bpf_text.replace("__BCC_ARGS_DEFINE__", bpf_args)
+
+IFNAMSIZ = 16
+my_FUNCNAME_MAX_LEN = 64
+my_NFT_NAME_MAX_LEN = 32
+my_TCPFLAGS = ["FIN", "SYN", "RST", "PSH", "ACK", "URG", "ECE", "CWR"]
+
+class my_TestEvt(ct.Structure):
+    _pack_ = 1
+    _fields_ = [
+        ("func_name",   ct.c_char * my_FUNCNAME_MAX_LEN),
+        ("flags",       ct.c_ubyte),
+
+        ("comm",        ct.c_char * IFNAMSIZ),
+        ("ifname",      ct.c_char * IFNAMSIZ),
+        ("netns",       ct.c_uint),
+
+        ("dest_mac",    ct.c_ubyte * 6),
+        ("len",         ct.c_uint),
+        ("ip_version",  ct.c_ubyte),
+        ("l4_proto",    ct.c_ubyte),
+        ("saddr",       ct.c_ulonglong * 2),
+        ("daddr",       ct.c_ulonglong * 2),
+        ("icmptype",    ct.c_ubyte),
+        ("icmpid",      ct.c_ushort),
+        ("icmpseq",     ct.c_ushort),
+        ("sport",       ct.c_ushort),
+        ("dport",       ct.c_ushort),
+        ("tcpflags",    ct.c_ushort),
+        ("seq",         ct.c_uint),
+        ("ack_seq",     ct.c_uint),
+
+        ("skb",         ct.c_ulonglong),
+        ("pkt_type",    ct.c_ubyte),
+
+        ("kernel_stack_id", ct.c_int),
+        ("kernel_ip",   ct.c_ulonglong),
+
+        ("nft_table",   ct.c_char * my_NFT_NAME_MAX_LEN),
+        ("nft_chain",   ct.c_char * my_NFT_NAME_MAX_LEN),
+    ]
+
+my_EXPECTED_SIZE = ct.sizeof(my_TestEvt)
+
+def my_get_tcpflags(tcpflags):
+    return ",".join([my_TCPFLAGS[i] for i in range(len(my_TCPFLAGS)) if tcpflags & (1 << i)])
+
+def my_icmp_desc(proto, icmptype):
+    # 关键：用 type 判断 REQ/RPL（IPv4/IPv6）
+    if proto == socket.IPPROTO_ICMP:
+        if icmptype == 8:
+            return "REQ"
+        if icmptype == 0:
+            return "RPL"
+        return f"T{icmptype}"
+    if proto == socket.IPPROTO_ICMPV6:
+        if icmptype == 128:
+            return "REQ6"
+        if icmptype == 129:
+            return "RPL6"
+        return f"T6_{icmptype}"
+    return f"T{icmptype}"
+
+def my_trans_bytes_to_string(bbytes):
+    return bbytes.decode(errors="replace") if isinstance(bbytes, (bytes, bytearray)) else bbytes
+
+def my_time_str():
+    return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f ")
+
+def my_print_stack(event):
+    stack_traces = b.get_table("my_stacks")
+    if event.kernel_stack_id > 0:
+        for addr in stack_traces.walk(event.kernel_stack_id):
+            print("    %s" % my_trans_bytes_to_string(b.sym(addr, -1, show_offset=True)))
+
+def my_event_printer(cpu, data, size):
+    if size < my_EXPECTED_SIZE:
+        return
+    raw = ct.string_at(data, my_EXPECTED_SIZE)
+    event = my_TestEvt.from_buffer_copy(raw)
+
+    # Handle IP addresses for tcp_cleanup events (which may not have full network info)
+    if event.ip_version == 4 and (event.saddr[0] != 0 or event.daddr[0] != 0):
+        try:
+            saddr = inet_ntop(AF_INET, pack("=I", event.saddr[0]))
+            daddr = inet_ntop(AF_INET, pack("=I", event.daddr[0]))
+        except:
+            saddr = "0.0.0.0"
+            daddr = "0.0.0.0"
+    elif event.ip_version == 6:
+        try:
+            saddr = inet_ntop(AF_INET6, bytes(event.saddr))
+            daddr = inet_ntop(AF_INET6, bytes(event.daddr))
+        except:
+            saddr = "::"
+            daddr = "::"
+    else:
+        saddr = "0.0.0.0"
+        daddr = "0.0.0.0"
+
+    mac_info = ':'.join(f'{b:02x}' for b in event.dest_mac)
+
+    if event.l4_proto == socket.IPPROTO_TCP:
+        pkt_info = "T_%s:%s:%u->%s:%u" % (my_get_tcpflags(event.tcpflags), saddr, event.sport, daddr, event.dport)
+    elif event.l4_proto == socket.IPPROTO_UDP:
+        pkt_info = "U:%s:%u->%s:%u" % (saddr, event.sport, daddr, event.dport)
+    elif event.l4_proto in (socket.IPPROTO_ICMP, socket.IPPROTO_ICMPV6):
+        desc = my_icmp_desc(event.l4_proto, event.icmptype)
+        pkt_info = "I(%s):%s->%s id=%u seq=%u type=%u" % (
+            desc, saddr, daddr, event.icmpid, event.icmpseq, event.icmptype
+        )
+    else:
+        pkt_info = "%u:%s->%s" % (event.l4_proto, saddr, daddr)
+
+    trace_info = "%x.%u:%s" % (
+        event.skb, event.pkt_type,
+        my_trans_bytes_to_string(event.func_name).rstrip("\x00")
+    )
+
+    nft_tbl = my_trans_bytes_to_string(event.nft_table).rstrip("\x00")
+    nft_chn = my_trans_bytes_to_string(event.nft_chain).rstrip("\x00")
+    nft_info = ""
+    if event.flags & 0x0008:  # my_ROUTE_EVENT_NFT
+        nft_info = f"  {nft_tbl}/{nft_chn}"
+
+    # Add event type info
+    event_info = ""
+    if event.flags & 0x0010:  # my_ROUTE_EVENT_SKBCOPY
+        event_info = " [SKB_COPY]"
+    elif event.flags & 0x0020:  # my_ROUTE_EVENT_TCP_CLEANUP
+        event_info = " [TCP_CLEANUP]"
+
+    print("[%-27s] [%-10u]  %-10s %-12s %-17s %-12u %-12u %-40s %s%s%s" % (
+        my_time_str(),
+        event.netns,
+        my_trans_bytes_to_string(event.comm).rstrip("\x00"),
+        my_trans_bytes_to_string(event.ifname).rstrip("\x00"),
+        mac_info,
+        event.seq,
+        event.ack_seq,
+        pkt_info,
+        trace_info,
+        nft_info,
+        event_info
+    ))
+
+    if args.dropstack or args.callstack:
+        my_print_stack(event)
+
+    args.catch_count -= 1
+    if args.catch_count <= 0:
+        sys.exit(0)
+
+if __name__ == "__main__":
+    if args.nft:
+        print(f"[nft offsets] pktinfo->skb={NFT_PKTINFO_SKB_OFF}, chain->table={NFT_CHAIN_TABLE_OFF}, chain->name={NFT_CHAIN_NAME_OFF}, table->name={NFT_TABLE_NAME_OFF}")
+        print("If table/chain still garbled, run your bpftrace offsetof script and override with:")
+        print("  --nft-pktinfo-skb-off X --nft-chain-table-off X --nft-chain-name-off X --nft-table-name-off X")
+        print()
+
+    try:
+        b = BPF(text=bpf_text, cflags=["-I/usr/local/include"])
+        b["my_route_event"].open_perf_buffer(my_event_printer)
+        print("Time                          NETWORK_NS    COMMAND    INTERFACE    DEST_MAC           Seq          Ack          PKT_INFO                                 TRACE_INFO  [TABLE/CHAIN if nft][EVENT_TYPE]")
+        
+        while True:
+            b.kprobe_poll(10)
+    except KeyboardInterrupt:
+        print("Received interrupt signal, exiting...", file=sys.stderr)
+        sys.exit(0)
+    except Exception as e:
+        print(f"An error occurred: {str(e)}", file=sys.stderr)
+        sys.exit(1)
